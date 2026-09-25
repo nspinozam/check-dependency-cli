@@ -1,7 +1,7 @@
 package main
 
 import (
-	"nspinozam.dev/check-dependency/cmd"
+	"github.com/nspinozam/check-dependency-cli/cmd"
 )
 
 func main() {

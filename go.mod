@@ -1,4 +1,4 @@
-module nspinozam.dev/check-dependency
+module github.com/nspinozam/check-dependency-cli
 
 go 1.26.0
 

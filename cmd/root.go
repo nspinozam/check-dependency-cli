@@ -3,7 +3,7 @@ package cmd
 import (
 	"github.com/spf13/cobra"
 
-	"nspinozam.dev/check-dependency/internal/checker"
+	"github.com/nspinozam/check-dependency-cli/internal/checker"
 )
 
 const version = "0.0.1"
