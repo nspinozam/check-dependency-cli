@@ -1,16 +1,28 @@
 dependencies:
+  # Kubernetes Secret backend.
   - apiVersion: v1
     kind: Secret
     name: database-credentials
     namespace: default
     key: password
 
+  # Dapr secret lookup through the secret-store Component.
+  - apiVersion: dapr.io/v1alpha1
+    kind: DaprSecret
+    name: database-credentials
+    namespace: default
+    key: password
+    secretStore: secret-store
+
   - apiVersion: apps/v1
     kind: Deployment
     name: payments-api
     namespace: default
 
+  # Dapr Secret Store component.
   - apiVersion: dapr.io/v1alpha1
     kind: Component
     name: secret-store
     namespace: default
+
+  

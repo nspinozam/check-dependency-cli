@@ -24,11 +24,12 @@ type Definition struct {
 }
 
 type Dependency struct {
-	APIVersion string `yaml:"apiVersion"`
-	Kind       string `yaml:"kind"`
-	Name       string `yaml:"name"`
-	Namespace  string `yaml:"namespace,omitempty"`
-	Key        string `yaml:"key,omitempty"`
+	APIVersion  string `yaml:"apiVersion"`
+	Kind        string `yaml:"kind"`
+	Name        string `yaml:"name"`
+	Namespace   string `yaml:"namespace,omitempty"`
+	Key         string `yaml:"key,omitempty"`
+	SecretStore string `yaml:"secretStore,omitempty"`
 }
 
 func Run(fileName, kubeconfig, contextName string) error {
@@ -96,6 +97,9 @@ func kubeConfig(kubeconfig, contextName string) (*rest.Config, error) {
 }
 
 func validateDependency(ctx context.Context, client dynamic.Interface, mapper *restmapper.DeferredDiscoveryRESTMapper, dependency Dependency) error {
+	if dependency.APIVersion == "dapr.io/v1alpha1" && dependency.Kind == "DaprSecret" {
+		return validateDaprSecret(ctx, client, mapper, dependency)
+	}
 	groupVersion, err := schema.ParseGroupVersion(dependency.APIVersion)
 	if err != nil {
 		return fmt.Errorf("dependency %s/%s: invalid apiVersion: %w", dependency.Kind, dependency.Name, err)
@@ -124,6 +128,35 @@ func validateDependency(ctx context.Context, client dynamic.Interface, mapper *r
 	}
 	if dependency.Kind == "Component" && dependency.APIVersion == "dapr.io/v1alpha1" {
 		return validateDaprSecretReferences(ctx, client, mapper, object, dependency.Namespace)
+	}
+	return nil
+}
+
+func validateDaprSecret(ctx context.Context, client dynamic.Interface, mapper *restmapper.DeferredDiscoveryRESTMapper, dependency Dependency) error {
+	if dependency.SecretStore == "" {
+		return fmt.Errorf("dapr secret %s/%s requires secretStore", dependency.Namespace, dependency.Name)
+	}
+	if dependency.Key == "" {
+		return fmt.Errorf("dapr secret %s/%s requires key", dependency.Namespace, dependency.Name)
+	}
+	store := Dependency{
+		APIVersion: "dapr.io/v1alpha1",
+		Kind:       "Component",
+		Name:       dependency.SecretStore,
+		Namespace:  dependency.Namespace,
+	}
+	if err := validateDependency(ctx, client, mapper, store); err != nil {
+		return fmt.Errorf("secret store %s/%s: %w", dependency.Namespace, dependency.SecretStore, err)
+	}
+	secret := Dependency{
+		APIVersion: "v1",
+		Kind:       "Secret",
+		Name:       dependency.Name,
+		Namespace:  dependency.Namespace,
+		Key:        dependency.Key,
+	}
+	if err := validateDependency(ctx, client, mapper, secret); err != nil {
+		return fmt.Errorf("dapr secret %s/%s: %w", dependency.Namespace, dependency.Name, err)
 	}
 	return nil
 }
