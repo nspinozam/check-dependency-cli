@@ -147,19 +147,17 @@ func validateDaprSecretReferences(ctx context.Context, client dynamic.Interface,
 	if err != nil || !found {
 		return err
 	}
-	for _, item := range metadata {
+	for index, item := range metadata {
 		entry, ok := item.(map[string]interface{})
 		if !ok {
 			continue
 		}
-		reference, ok := entry["secretKeyRef"].(map[string]interface{})
-		if !ok {
-			continue
+		name, key, found, err := daprSecretReference(entry)
+		if err != nil {
+			return fmt.Errorf("invalid secretKeyRef in component metadata %d: %w", index+1, err)
 		}
-		name, _ := reference["name"].(string)
-		key, _ := reference["key"].(string)
-		if name == "" || key == "" {
-			return fmt.Errorf("invalid secretKeyRef in component")
+		if !found {
+			continue
 		}
 		secret := Dependency{APIVersion: "v1", Kind: "Secret", Name: name, Namespace: namespace, Key: key}
 		if err := validateDependency(ctx, client, mapper, secret); err != nil {
@@ -167,4 +165,20 @@ func validateDaprSecretReferences(ctx context.Context, client dynamic.Interface,
 		}
 	}
 	return nil
+}
+
+func daprSecretReference(entry map[string]interface{}) (string, string, bool, error) {
+	reference, found, err := unstructured.NestedMap(entry, "secretKeyRef")
+	if err != nil {
+		return "", "", false, err
+	}
+	if !found {
+		return "", "", false, nil
+	}
+	name, nameOK := reference["name"].(string)
+	key, keyOK := reference["key"].(string)
+	if !nameOK || !keyOK || name == "" || key == "" {
+		return "", "", true, errors.New("name and key are required")
+	}
+	return name, key, true, nil
 }
