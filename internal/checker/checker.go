@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -19,6 +20,7 @@ import (
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
@@ -54,6 +56,10 @@ func Run(fileName, kubeconfig, contextName, daprHTTPAddress string) error {
 	if err != nil {
 		return fmt.Errorf("create Kubernetes client: %w", err)
 	}
+	kubernetesClient, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("create Kubernetes typed client: %w", err)
+	}
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
 	if err != nil {
 		return fmt.Errorf("create Kubernetes discovery client: %w", err)
@@ -61,11 +67,120 @@ func Run(fileName, kubeconfig, contextName, daprHTTPAddress string) error {
 	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(discoveryClient))
 
 	ctx := context.Background()
+	var sidecar *daprSidecar
+	defer func() {
+		if sidecar != nil {
+			_ = sidecar.delete(context.Background())
+		}
+	}()
 	for _, dependency := range definition.Dependencies {
-		if err := validateDependency(ctx, dynamicClient, mapper, daprHTTPAddress, dependency); err != nil {
+		address := daprHTTPAddress
+		if dependency.APIVersion == "dapr.io/v1alpha1" && dependency.Kind == "DaprSecret" {
+			if sidecar == nil {
+				sidecar, err = createDaprSidecar(ctx, kubernetesClient, dependency.Namespace)
+				if err != nil {
+					return err
+				}
+			}
+			address = sidecar.address
+		}
+		if err := validateDependency(ctx, dynamicClient, mapper, address, dependency); err != nil {
 			return err
 		}
 		fmt.Printf("OK %s/%s %s\n", dependency.Kind, dependency.Namespace, dependency.Name)
+	}
+	return nil
+}
+
+type daprSidecar struct {
+	client    kubernetes.Interface
+	namespace string
+	name      string
+	address   string
+}
+
+func createDaprSidecar(ctx context.Context, client kubernetes.Interface, namespace string) (*daprSidecar, error) {
+	if namespace == "" {
+		namespace = "default"
+	}
+	pod, err := client.CoreV1().Pods(namespace).Create(ctx, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "check-dependency-dapr-",
+			Namespace:    namespace,
+			Annotations: map[string]string{
+				"dapr.io/enabled":                  "true",
+				"dapr.io/app-id":                   "check-dependency",
+				"dapr.io/app-port":                 "8080",
+				"dapr.io/sidecar-listen-addresses": "0.0.0.0",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			Containers: []corev1.Container{{
+				Name:    "holder",
+				Image:   "busybox:1.36",
+				Command: []string{"sleep", "3600"},
+			}},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("create Dapr sidecar pod: %w", err)
+	}
+	sidecar := &daprSidecar{
+		client:    client,
+		namespace: namespace,
+		name:      pod.Name,
+	}
+	if err := sidecar.wait(ctx); err != nil {
+		_ = sidecar.delete(context.Background())
+		return nil, err
+	}
+	return sidecar, nil
+}
+
+func (sidecar *daprSidecar) wait(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		pod, err := sidecar.client.CoreV1().Pods(sidecar.namespace).Get(ctx, sidecar.name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("get Dapr sidecar pod: %w", err)
+		}
+		if pod.Status.Phase == corev1.PodFailed {
+			return fmt.Errorf("Dapr sidecar pod failed")
+		}
+		if pod.Status.PodIP != "" && pod.Status.Phase == corev1.PodRunning {
+			sidecar.address = "http://" + pod.Status.PodIP + ":3500"
+			if err := checkDaprHealth(ctx, sidecar.address); err == nil {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for Dapr sidecar pod: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func (sidecar *daprSidecar) delete(ctx context.Context) error {
+	return sidecar.client.CoreV1().Pods(sidecar.namespace).Delete(ctx, sidecar.name, metav1.DeleteOptions{})
+}
+
+func checkDaprHealth(ctx context.Context, address string) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(address, "/")+"/v1.0/healthz", nil)
+	if err != nil {
+		return err
+	}
+	response, err := (&http.Client{Timeout: time.Second}).Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("Dapr health check returned %s", response.Status)
 	}
 	return nil
 }
