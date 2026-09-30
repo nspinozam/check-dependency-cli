@@ -1,6 +1,11 @@
 package checker
 
-import "testing"
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
 
 func TestDaprSecretReference(t *testing.T) {
 	tests := []struct {
@@ -52,5 +57,41 @@ func TestDaprSecretReference(t *testing.T) {
 				t.Fatalf("got name=%q key=%q found=%v, want name=%q key=%q found=%v", name, key, found, test.wantName, test.wantKey, test.wantFound)
 			}
 		})
+	}
+}
+
+func TestValidateDaprSecretUsesSidecar(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1.0/secrets/secret/db" {
+			t.Fatalf("got path %q, want %q", request.URL.Path, "/v1.0/secrets/secret/db")
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"MONGO_DB":"mongodb://mongo"}`))
+	}))
+	defer server.Close()
+
+	err := validateDaprSecret(context.Background(), server.URL, Dependency{
+		Name:        "db",
+		Key:         "MONGO_DB",
+		SecretStore: "secret",
+	})
+	if err != nil {
+		t.Fatalf("validate Dapr secret: %v", err)
+	}
+}
+
+func TestValidateDaprSecretMissingKey(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		_, _ = response.Write([]byte(`{"OTHER":"value"}`))
+	}))
+	defer server.Close()
+
+	err := validateDaprSecret(context.Background(), server.URL, Dependency{
+		Name:        "db",
+		Key:         "MONGO_DB",
+		SecretStore: "secret",
+	})
+	if err == nil {
+		t.Fatal("expected missing key error")
 	}
 }

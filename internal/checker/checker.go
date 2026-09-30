@@ -2,9 +2,14 @@ package checker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
+	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -32,7 +37,7 @@ type Dependency struct {
 	SecretStore string `yaml:"secretStore,omitempty"`
 }
 
-func Run(fileName, kubeconfig, contextName string) error {
+func Run(fileName, kubeconfig, contextName, daprHTTPAddress string) error {
 	definition, err := loadDefinition(fileName)
 	if err != nil {
 		return err
@@ -57,7 +62,7 @@ func Run(fileName, kubeconfig, contextName string) error {
 
 	ctx := context.Background()
 	for _, dependency := range definition.Dependencies {
-		if err := validateDependency(ctx, dynamicClient, mapper, dependency); err != nil {
+		if err := validateDependency(ctx, dynamicClient, mapper, daprHTTPAddress, dependency); err != nil {
 			return err
 		}
 		fmt.Printf("OK %s/%s %s\n", dependency.Kind, dependency.Namespace, dependency.Name)
@@ -96,9 +101,9 @@ func kubeConfig(kubeconfig, contextName string) (*rest.Config, error) {
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, overrides).ClientConfig()
 }
 
-func validateDependency(ctx context.Context, client dynamic.Interface, mapper *restmapper.DeferredDiscoveryRESTMapper, dependency Dependency) error {
+func validateDependency(ctx context.Context, client dynamic.Interface, mapper *restmapper.DeferredDiscoveryRESTMapper, daprHTTPAddress string, dependency Dependency) error {
 	if dependency.APIVersion == "dapr.io/v1alpha1" && dependency.Kind == "DaprSecret" {
-		return validateDaprSecret(ctx, client, mapper, dependency)
+		return validateDaprSecret(ctx, daprHTTPAddress, dependency)
 	}
 	groupVersion, err := schema.ParseGroupVersion(dependency.APIVersion)
 	if err != nil {
@@ -132,31 +137,35 @@ func validateDependency(ctx context.Context, client dynamic.Interface, mapper *r
 	return nil
 }
 
-func validateDaprSecret(ctx context.Context, client dynamic.Interface, mapper *restmapper.DeferredDiscoveryRESTMapper, dependency Dependency) error {
+func validateDaprSecret(ctx context.Context, daprHTTPAddress string, dependency Dependency) error {
 	if dependency.SecretStore == "" {
 		return fmt.Errorf("dapr secret %s/%s requires secretStore", dependency.Namespace, dependency.Name)
 	}
 	if dependency.Key == "" {
 		return fmt.Errorf("dapr secret %s/%s requires key", dependency.Namespace, dependency.Name)
 	}
-	store := Dependency{
-		APIVersion: "dapr.io/v1alpha1",
-		Kind:       "Component",
-		Name:       dependency.SecretStore,
-		Namespace:  dependency.Namespace,
+	if daprHTTPAddress == "" {
+		return errors.New("dapr HTTP address is required")
 	}
-	if err := validateDependency(ctx, client, mapper, store); err != nil {
-		return fmt.Errorf("secret store %s/%s: %w", dependency.Namespace, dependency.SecretStore, err)
+	endpoint := strings.TrimRight(daprHTTPAddress, "/") + "/v1.0/secrets/" + url.PathEscape(dependency.SecretStore) + "/" + url.PathEscape(dependency.Name)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return fmt.Errorf("create Dapr secret request: %w", err)
 	}
-	secret := Dependency{
-		APIVersion: "v1",
-		Kind:       "Secret",
-		Name:       dependency.Name,
-		Namespace:  dependency.Namespace,
-		Key:        dependency.Key,
+	response, err := (&http.Client{Timeout: 10 * time.Second}).Do(request)
+	if err != nil {
+		return fmt.Errorf("get Dapr secret %s/%s: %w", dependency.SecretStore, dependency.Name, err)
 	}
-	if err := validateDependency(ctx, client, mapper, secret); err != nil {
-		return fmt.Errorf("dapr secret %s/%s: %w", dependency.Namespace, dependency.Name, err)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("get Dapr secret %s/%s: unexpected HTTP status %s", dependency.SecretStore, dependency.Name, response.Status)
+	}
+	var secret map[string]json.RawMessage
+	if err := json.NewDecoder(response.Body).Decode(&secret); err != nil {
+		return fmt.Errorf("decode Dapr secret %s/%s: %w", dependency.SecretStore, dependency.Name, err)
+	}
+	if _, found := secret[dependency.Key]; !found {
+		return fmt.Errorf("dapr secret %s/%s: missing key %q", dependency.SecretStore, dependency.Name, dependency.Key)
 	}
 	return nil
 }
@@ -193,7 +202,7 @@ func validateDaprSecretReferences(ctx context.Context, client dynamic.Interface,
 			continue
 		}
 		secret := Dependency{APIVersion: "v1", Kind: "Secret", Name: name, Namespace: namespace, Key: key}
-		if err := validateDependency(ctx, client, mapper, secret); err != nil {
+		if err := validateDependency(ctx, client, mapper, "", secret); err != nil {
 			return fmt.Errorf("component secret reference: %w", err)
 		}
 	}
