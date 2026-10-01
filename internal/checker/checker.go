@@ -118,7 +118,7 @@ func createDaprSidecar(ctx context.Context, client kubernetes.Interface, namespa
 			Annotations: map[string]string{
 				"dapr.io/enabled":                  "true",
 				"dapr.io/app-id":                   "check-dependency",
-				"dapr.io/app-port":                 "3501",
+				"dapr.io/app-port":                 "3500",
 				"dapr.io/sidecar-listen-addresses": "0.0.0.0",
 			},
 		},
@@ -167,7 +167,7 @@ func createDaprSidecar(ctx context.Context, client kubernetes.Interface, namespa
 }
 
 func (sidecar *daprSidecar) wait(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, time.Minute*3)
 	defer cancel()
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
