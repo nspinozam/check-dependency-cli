@@ -198,7 +198,7 @@ func checkDaprHealth(ctx context.Context, client kubernetes.Interface, namespace
 }
 
 func curlDapr(ctx context.Context, client kubernetes.Interface, namespace, endpoint string, retry bool) ([]byte, error) {
-	command := "curl --fail --silent --show-error --max-time 10 \"$DAPR_URL\""
+	command := "curl --fail-with-body --silent --show-error --max-time 10 \"$DAPR_URL\""
 	if retry {
 		command = "until " + command + "; do sleep 1; done"
 	}
@@ -227,18 +227,17 @@ func curlDapr(ctx context.Context, client kubernetes.Interface, namespace, endpo
 		}
 		switch pod.Status.Phase {
 		case corev1.PodSucceeded:
-			logs, err := client.CoreV1().Pods(namespace).GetLogs(pod.Name, &corev1.PodLogOptions{Container: "curl"}).Stream(ctx)
+			body, err := daprCurlLogs(ctx, client, namespace, pod.Name)
 			if err != nil {
-				return nil, fmt.Errorf("get Dapr curl pod logs: %w", err)
-			}
-			defer logs.Close()
-			body, err := io.ReadAll(logs)
-			if err != nil {
-				return nil, fmt.Errorf("read Dapr curl pod logs: %w", err)
+				return nil, err
 			}
 			return body, nil
 		case corev1.PodFailed:
-			return nil, fmt.Errorf("Dapr curl pod failed")
+			body, logErr := daprCurlLogs(ctx, client, namespace, pod.Name)
+			if logErr == nil && strings.TrimSpace(string(body)) != "" {
+				return nil, fmt.Errorf("Dapr curl pod failed: %s", strings.TrimSpace(string(body)))
+			}
+			return nil, fmt.Errorf("Dapr curl pod failed: reason=%s message=%s", pod.Status.Reason, pod.Status.Message)
 		}
 		select {
 		case <-ctx.Done():
@@ -246,6 +245,19 @@ func curlDapr(ctx context.Context, client kubernetes.Interface, namespace, endpo
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
+}
+
+func daprCurlLogs(ctx context.Context, client kubernetes.Interface, namespace, podName string) ([]byte, error) {
+	logs, err := client.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{Container: "curl"}).Stream(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get Dapr curl pod logs: %w", err)
+	}
+	defer logs.Close()
+	body, err := io.ReadAll(logs)
+	if err != nil {
+		return nil, fmt.Errorf("read Dapr curl pod logs: %w", err)
+	}
+	return body, nil
 }
 
 func loadDefinition(fileName string) (Definition, error) {
