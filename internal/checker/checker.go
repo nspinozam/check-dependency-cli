@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -82,7 +83,7 @@ func Run(fileName, kubeconfig, contextName, daprHTTPAddress string) error {
 				address = sidecar.address
 			}
 		}
-		if err := validateDependency(ctx, dynamicClient, mapper, address, dependency); err != nil {
+		if err := validateDependency(ctx, dynamicClient, kubernetesClient, mapper, address, dependency); err != nil {
 			return err
 		}
 		fmt.Printf("OK %s/%s %s\n", dependency.Kind, dependency.Namespace, dependency.Name)
@@ -192,6 +193,15 @@ func (sidecar *daprSidecar) wait(ctx context.Context) error {
 }
 
 func checkDaprHealth(ctx context.Context, client kubernetes.Interface, namespace, address string) error {
+	_, err := curlDapr(ctx, client, namespace, strings.TrimRight(address, "/")+"/v1.0/healthz", true)
+	return err
+}
+
+func curlDapr(ctx context.Context, client kubernetes.Interface, namespace, endpoint string, retry bool) ([]byte, error) {
+	command := "curl --fail --silent --show-error --max-time 10 \"$DAPR_URL\""
+	if retry {
+		command = "until " + command + "; do sleep 1; done"
+	}
 	pod, err := client.CoreV1().Pods(namespace).Create(ctx, &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{GenerateName: "check-dependency-curl-", Namespace: namespace},
 		Spec: corev1.PodSpec{
@@ -199,13 +209,13 @@ func checkDaprHealth(ctx context.Context, client kubernetes.Interface, namespace
 			Containers: []corev1.Container{{
 				Name:    "curl",
 				Image:   "curlimages/curl:8.11.1",
-				Command: []string{"sh", "-c", "until curl --fail --silent --show-error --max-time 5 \"$DAPR_HEALTH_URL\"; do sleep 1; done"},
-				Env:     []corev1.EnvVar{{Name: "DAPR_HEALTH_URL", Value: strings.TrimRight(address, "/") + "/v1.0/healthz"}},
+				Command: []string{"sh", "-c", command},
+				Env:     []corev1.EnvVar{{Name: "DAPR_URL", Value: endpoint}},
 			}},
 		},
 	}, metav1.CreateOptions{})
 	if err != nil {
-		return fmt.Errorf("create Dapr health check pod: %w", err)
+		return nil, fmt.Errorf("create Dapr curl pod: %w", err)
 	}
 	defer func() {
 		_ = client.CoreV1().Pods(namespace).Delete(context.Background(), pod.Name, metav1.DeleteOptions{})
@@ -213,17 +223,26 @@ func checkDaprHealth(ctx context.Context, client kubernetes.Interface, namespace
 	for {
 		pod, err = client.CoreV1().Pods(namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 		if err != nil {
-			return fmt.Errorf("get Dapr health check pod: %w", err)
+			return nil, fmt.Errorf("get Dapr curl pod: %w", err)
 		}
 		switch pod.Status.Phase {
 		case corev1.PodSucceeded:
-			return nil
+			logs, err := client.CoreV1().Pods(namespace).GetLogs(pod.Name, &corev1.PodLogOptions{Container: "curl"}).Stream(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("get Dapr curl pod logs: %w", err)
+			}
+			defer logs.Close()
+			body, err := io.ReadAll(logs)
+			if err != nil {
+				return nil, fmt.Errorf("read Dapr curl pod logs: %w", err)
+			}
+			return body, nil
 		case corev1.PodFailed:
-			return fmt.Errorf("Dapr health check pod failed")
+			return nil, fmt.Errorf("Dapr curl pod failed")
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("wait for Dapr health check pod: %w", ctx.Err())
+			return nil, fmt.Errorf("wait for Dapr curl pod: %w", ctx.Err())
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
@@ -260,9 +279,9 @@ func kubeConfig(kubeconfig, contextName string) (*rest.Config, error) {
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, overrides).ClientConfig()
 }
 
-func validateDependency(ctx context.Context, client dynamic.Interface, mapper *restmapper.DeferredDiscoveryRESTMapper, daprHTTPAddress string, dependency Dependency) error {
+func validateDependency(ctx context.Context, client dynamic.Interface, kubernetesClient kubernetes.Interface, mapper *restmapper.DeferredDiscoveryRESTMapper, daprHTTPAddress string, dependency Dependency) error {
 	if dependency.APIVersion == "dapr.io/v1alpha1" && dependency.Kind == "DaprSecret" {
-		return validateDaprSecret(ctx, daprHTTPAddress, dependency)
+		return validateDaprSecretFromPod(ctx, kubernetesClient, daprHTTPAddress, dependency)
 	}
 	groupVersion, err := schema.ParseGroupVersion(dependency.APIVersion)
 	if err != nil {
@@ -291,7 +310,36 @@ func validateDependency(ctx context.Context, client dynamic.Interface, mapper *r
 		}
 	}
 	if dependency.Kind == "Component" && dependency.APIVersion == "dapr.io/v1alpha1" {
-		return validateDaprSecretReferences(ctx, client, mapper, object, dependency.Namespace)
+		return validateDaprSecretReferences(ctx, client, kubernetesClient, mapper, object, dependency.Namespace)
+	}
+	return nil
+}
+
+func validateDaprSecretFromPod(ctx context.Context, client kubernetes.Interface, daprHTTPAddress string, dependency Dependency) error {
+	namespace := dependency.Namespace
+	if namespace == "" {
+		namespace = "default"
+	}
+	if dependency.SecretStore == "" {
+		return fmt.Errorf("dapr secret %s/%s requires secretStore", dependency.Namespace, dependency.Name)
+	}
+	if dependency.Key == "" {
+		return fmt.Errorf("dapr secret %s/%s requires key", dependency.Namespace, dependency.Name)
+	}
+	if daprHTTPAddress == "" {
+		return errors.New("dapr HTTP address is required")
+	}
+	endpoint := strings.TrimRight(daprHTTPAddress, "/") + "/v1.0/secrets/" + url.PathEscape(dependency.SecretStore) + "/" + url.PathEscape(dependency.Name)
+	body, err := curlDapr(ctx, client, namespace, endpoint, false)
+	if err != nil {
+		return fmt.Errorf("get Dapr secret %s/%s: %w", dependency.SecretStore, dependency.Name, err)
+	}
+	var secret map[string]json.RawMessage
+	if err := json.Unmarshal(body, &secret); err != nil {
+		return fmt.Errorf("decode Dapr secret %s/%s: %w", dependency.SecretStore, dependency.Name, err)
+	}
+	if _, found := secret[dependency.Key]; !found {
+		return fmt.Errorf("dapr secret %s/%s: missing key %q", dependency.SecretStore, dependency.Name, dependency.Key)
 	}
 	return nil
 }
@@ -343,7 +391,7 @@ func validateSecretKey(object *unstructured.Unstructured, key string) error {
 	return nil
 }
 
-func validateDaprSecretReferences(ctx context.Context, client dynamic.Interface, mapper *restmapper.DeferredDiscoveryRESTMapper, component *unstructured.Unstructured, namespace string) error {
+func validateDaprSecretReferences(ctx context.Context, client dynamic.Interface, kubernetesClient kubernetes.Interface, mapper *restmapper.DeferredDiscoveryRESTMapper, component *unstructured.Unstructured, namespace string) error {
 	metadata, found, err := unstructured.NestedSlice(component.Object, "spec", "metadata")
 	if err != nil || !found {
 		return err
@@ -361,7 +409,7 @@ func validateDaprSecretReferences(ctx context.Context, client dynamic.Interface,
 			continue
 		}
 		secret := Dependency{APIVersion: "v1", Kind: "Secret", Name: name, Namespace: namespace, Key: key}
-		if err := validateDependency(ctx, client, mapper, "", secret); err != nil {
+		if err := validateDependency(ctx, client, kubernetesClient, mapper, "", secret); err != nil {
 			return fmt.Errorf("component secret reference: %w", err)
 		}
 	}
