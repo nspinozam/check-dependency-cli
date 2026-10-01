@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
@@ -76,13 +78,15 @@ func Run(fileName, kubeconfig, contextName, daprHTTPAddress string) error {
 	for _, dependency := range definition.Dependencies {
 		address := daprHTTPAddress
 		if dependency.APIVersion == "dapr.io/v1alpha1" && dependency.Kind == "DaprSecret" {
-			if sidecar == nil {
+			if address == "" && sidecar == nil {
 				sidecar, err = createDaprSidecar(ctx, kubernetesClient, dependency.Namespace)
 				if err != nil {
 					return err
 				}
 			}
-			address = sidecar.address
+			if address == "" {
+				address = sidecar.address
+			}
 		}
 		if err := validateDependency(ctx, dynamicClient, mapper, address, dependency); err != nil {
 			return err
@@ -96,6 +100,7 @@ type daprSidecar struct {
 	client    kubernetes.Interface
 	namespace string
 	name      string
+	service   string
 	address   string
 }
 
@@ -103,14 +108,17 @@ func createDaprSidecar(ctx context.Context, client kubernetes.Interface, namespa
 	if namespace == "" {
 		namespace = "default"
 	}
+	instance := strconv.FormatInt(time.Now().UnixNano(), 10)
+	labels := map[string]string{"check-dependency/instance": instance}
 	pod, err := client.CoreV1().Pods(namespace).Create(ctx, &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "check-dependency-dapr-",
 			Namespace:    namespace,
+			Labels:       labels,
 			Annotations: map[string]string{
 				"dapr.io/enabled":                  "true",
 				"dapr.io/app-id":                   "check-dependency",
-				"dapr.io/app-port":                 "8080",
+				"dapr.io/app-port":                 "3501",
 				"dapr.io/sidecar-listen-addresses": "0.0.0.0",
 			},
 		},
@@ -126,10 +134,30 @@ func createDaprSidecar(ctx context.Context, client kubernetes.Interface, namespa
 	if err != nil {
 		return nil, fmt.Errorf("create Dapr sidecar pod: %w", err)
 	}
+	service, err := client.CoreV1().Services(namespace).Create(ctx, &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "check-dependency-dapr-",
+			Namespace:    namespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: labels,
+			Ports: []corev1.ServicePort{{
+				Name:       "http",
+				Port:       3500,
+				TargetPort: intstr.FromInt(3500),
+			}},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		_ = client.CoreV1().Pods(namespace).Delete(context.Background(), pod.Name, metav1.DeleteOptions{})
+		return nil, fmt.Errorf("create Dapr sidecar service: %w", err)
+	}
 	sidecar := &daprSidecar{
 		client:    client,
 		namespace: namespace,
 		name:      pod.Name,
+		service:   service.Name,
+		address:   fmt.Sprintf("http://%s.%s.svc.cluster.local:3500", service.Name, namespace),
 	}
 	if err := sidecar.wait(ctx); err != nil {
 		_ = sidecar.delete(context.Background())
@@ -151,8 +179,7 @@ func (sidecar *daprSidecar) wait(ctx context.Context) error {
 		if pod.Status.Phase == corev1.PodFailed {
 			return fmt.Errorf("Dapr sidecar pod failed")
 		}
-		if pod.Status.PodIP != "" && pod.Status.Phase == corev1.PodRunning {
-			sidecar.address = "http://" + pod.Status.PodIP + ":3500"
+		if pod.Status.Phase == corev1.PodRunning {
 			if err := checkDaprHealth(ctx, sidecar.address); err == nil {
 				return nil
 			}
@@ -166,7 +193,16 @@ func (sidecar *daprSidecar) wait(ctx context.Context) error {
 }
 
 func (sidecar *daprSidecar) delete(ctx context.Context) error {
-	return sidecar.client.CoreV1().Pods(sidecar.namespace).Delete(ctx, sidecar.name, metav1.DeleteOptions{})
+	var firstErr error
+	if sidecar.service != "" {
+		if err := sidecar.client.CoreV1().Services(sidecar.namespace).Delete(ctx, sidecar.service, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			firstErr = err
+		}
+	}
+	if err := sidecar.client.CoreV1().Pods(sidecar.namespace).Delete(ctx, sidecar.name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
 }
 
 func checkDaprHealth(ctx context.Context, address string) error {

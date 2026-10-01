@@ -6,7 +6,7 @@ import (
 	"github.com/nspinozam/check-dependency-cli/internal/checker"
 )
 
-const version = "0.0.4"
+const version = "0.0.5"
 
 var rootCmd = &cobra.Command{
 	Use:     "check-dependency",
@@ -34,7 +34,7 @@ func init() {
 	checkCmd.Flags().StringVarP(&checkFile, "file", "f", "dependencies.yaml", "Dependency definition file")
 	checkCmd.Flags().StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig")
 	checkCmd.Flags().StringVar(&contextName, "context", "", "Kubeconfig context")
-	checkCmd.Flags().StringVar(&daprHTTPAddress, "dapr-http-address", "http://127.0.0.1:3500", "Dapr sidecar HTTP address")
+	checkCmd.Flags().StringVar(&daprHTTPAddress, "dapr-http-address", "", "Optional Dapr Service or Ingress HTTP address")
 	rootCmd.AddCommand(checkCmd)
 }
 
