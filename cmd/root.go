@@ -6,7 +6,7 @@ import (
 	"github.com/nspinozam/check-dependency-cli/internal/checker"
 )
 
-const version = "0.0.5"
+const version = "0.0.8"
 
 var rootCmd = &cobra.Command{
 	Use:     "check-dependency",
